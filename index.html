@@ -309,14 +309,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         if (n.photoBlobId) blobIds.add(n.photoBlobId);
         if (n.audioBlobId) blobIds.add(n.audioBlobId);
       }
-      const t = tx(["projects", "plans", "nodes", "blobs"], "readwrite");
-      for (const n of nodes) await reqToPromise(t.objectStore("nodes").delete(n.id));
-      for (const p of plans) await reqToPromise(t.objectStore("plans").delete(p.id));
-      await reqToPromise(t.objectStore("projects").delete(id));
-      for (const bid of blobIds) await reqToPromise(t.objectStore("blobs").delete(bid));
       await new Promise((res, rej) => {
+        const t = tx(["projects", "plans", "nodes", "blobs"], "readwrite");
         t.oncomplete = () => res();
         t.onerror = () => rej(t.error);
+        const nodesStore = t.objectStore("nodes");
+        const plansStore = t.objectStore("plans");
+        const blobsStore = t.objectStore("blobs");
+        for (const n of nodes) nodesStore.delete(n.id);
+        for (const p of plans) plansStore.delete(p.id);
+        t.objectStore("projects").delete(id);
+        for (const bid of blobIds) blobsStore.delete(bid);
       });
     },
     async touchProject(id) {
@@ -359,11 +362,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       await this.delBlob(plan.imageBlobId);
       await reqToPromise(tx(["plans"], "readwrite").objectStore("plans").delete(planId));
       const remaining = await this.listPlans(projectId);
-      const t = tx(["plans"], "readwrite");
-      for (let i = 0; i < remaining.length; i++) {
-        remaining[i].sortOrder = i;
-        await reqToPromise(t.objectStore("plans").put(remaining[i]));
-      }
+      await new Promise((res, rej) => {
+        const t = tx(["plans"], "readwrite");
+        t.oncomplete = () => res();
+        t.onerror = () => rej(t.error);
+        const store = t.objectStore("plans");
+        for (let i = 0; i < remaining.length; i++) {
+          remaining[i].sortOrder = i;
+          store.put(remaining[i]);
+        }
+      });
       await this.touchProject(projectId);
     },
     async syncPlanPixelSize(projectId, planId) {
@@ -576,9 +584,20 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     state.blobUrlCache.clear();
   }
 
+  function getViewContextNode(nodes) {
+    if (!state.viewContextNodeId) return null;
+    return nodes.find((n) => n.id === state.viewContextNodeId) ?? null;
+  }
+
   function navigate(view, params = {}) {
     state.view = view;
     if (params.projectId !== undefined) state.projectId = params.projectId;
+    if (params.planId !== undefined && params.planId !== state.planId) {
+      state.viewContextNodeId = null;
+      state.pendingChildParentId = null;
+      state.selectedNodeId = null;
+      state.userAdjusted = false;
+    }
     if (params.planId !== undefined) state.planId = params.planId;
     if (view !== "plan") {
       state.viewContextNodeId = null;
@@ -710,16 +729,27 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       });
     });
     main.querySelectorAll('[data-action="del-eval"]').forEach((b) => {
-      b.onclick = async () => {
+      b.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         if (!confirm("¿Eliminar esta evaluación y todos sus datos?")) return;
-        await repo.deleteProject(b.getAttribute("data-id"));
-        toast("Evaluación eliminada");
-        clearBlobCache();
-        render();
+        try {
+          await repo.deleteProject(b.getAttribute("data-id"));
+          toast("Evaluación eliminada");
+          clearBlobCache();
+          render();
+        } catch (err) {
+          console.error(err);
+          toast("No se pudo eliminar la evaluación", "error");
+        }
       };
     });
     main.querySelectorAll('[data-action="edit-eval"]').forEach((b) => {
-      b.onclick = () => openEditEvalModal(b.getAttribute("data-id"));
+      b.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openEditEvalModal(b.getAttribute("data-id"));
+      };
     });
   }
 
@@ -1010,6 +1040,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       return;
     }
     let nodes = (await repo.listNodes(state.projectId)).filter((n) => n.planId === state.planId);
+    if (state.viewContextNodeId && !nodes.some((n) => n.id === state.viewContextNodeId)) {
+      state.viewContextNodeId = null;
+    }
+    if (state.pendingChildParentId && !nodes.some((n) => n.id === state.pendingChildParentId)) {
+      state.pendingChildParentId = null;
+    }
     let contextNode = state.viewContextNodeId
       ? nodes.find((n) => n.id === state.viewContextNodeId)
       : null;
@@ -1252,7 +1288,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (planDrag && planDrag.pointerId === e.pointerId && !planDrag.place) {
         const dx = e.clientX - planDrag.x;
         const dy = e.clientY - planDrag.y;
-        if (Math.hypot(dx, dy) > 4) panMoved = true;
+        if (Math.hypot(dx, dy) > 10) panMoved = true;
+        if (!panMoved) return;
         state.userAdjusted = true;
         state.stage.x = planDrag.ox + dx;
         state.stage.y = planDrag.oy + dy;
@@ -1283,14 +1320,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const dx = e.clientX - planDrag.x;
         const dy = e.clientY - planDrag.y;
         planDrag = null;
-        if (wasPlace && Math.hypot(dx, dy) < 8) {
+        const tap = Math.hypot(dx, dy) < 10;
+        if (wasPlace && tap) {
           await onPlanClick(pointerToPlan(e.clientX, e.clientY), nodes);
-        } else if (
-          !placementMode &&
-          !state.viewContextNodeId &&
-          Math.hypot(dx, dy) < 8 &&
-          !panMoved
-        ) {
+        } else if (!placementMode && !getViewContextNode(nodes) && tap && !panMoved) {
           await onPlanClick(pointerToPlan(e.clientX, e.clientY), nodes);
         }
       }
@@ -1301,10 +1334,18 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (state.pendingChildParentId) {
       const parent = nodes.find((n) => n.id === state.pendingChildParentId);
       state.pendingChildParentId = null;
+      if (!parent) {
+        toast("No se encontró la observación padre", "error");
+        return;
+      }
+      if (parent.depth >= MAX_NODE_DEPTH) {
+        toast("No se pueden añadir más niveles", "error");
+        return;
+      }
       openNewNodeModal(parent, coord);
       return;
     }
-    if (state.viewContextNodeId) return;
+    if (getViewContextNode(nodes)) return;
     openNewNodeModal(null, coord);
   }
 
@@ -1386,20 +1427,25 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
 
     aside.innerHTML = `<div class="node-tree">
-    <div class="node-tree-header"><h2 class="section-title">Observaciones</h2></div>
+    <div class="node-tree-header">
+      <h2 class="section-title">Observaciones</h2>
+      ${btn("+ Plano", { variant: "ghost", size: "sm", action: "add-root" })}
+    </div>
     ${list || "<p class='muted'>Sin observaciones.</p>"}
     ${notesPanel}
   </div>`;
 
+    aside.querySelector('[data-action="add-root"]')?.addEventListener("click", () => {
+      state.viewContextNodeId = null;
+      state.pendingChildParentId = null;
+      state.userAdjusted = false;
+      toast("Toca el plano para ubicar la observación");
+      render();
+    });
+
     aside.querySelectorAll("[data-select]").forEach((b) => {
       b.onclick = () => {
-        const id = b.getAttribute("data-select");
-        const node = nodes.find((n) => n.id === id);
-        state.selectedNodeId = id;
-        if (node?.photoBlobId) {
-          state.viewContextNodeId = id;
-          state.userAdjusted = false;
-        }
+        state.selectedNodeId = b.getAttribute("data-select");
         render();
       };
     });
